@@ -1,98 +1,99 @@
 import os
 import sys
-import subprocess
-from dotenv import load_dotenv
-import requests
 import pyzipper
+import requests
+from flask import Flask, request, send_file, jsonify
+from dotenv import load_dotenv
+import subprocess
 
-# === CONFIG ===
-ENV_ENCRYPTED_FILE = ".env.enc"
-ENV_DECRYPTED_FILE = ".env"
-DECRYPTION_PASSWORD = os.getenv("ENV_SECRET_PASSWORD")  # Set this securely!
+# === Flask app ===
+app = Flask(__name__)
 
-# === STEP 1: Decrypt .env.enc ===
-if not DECRYPTION_PASSWORD:
-    print("❌ Missing ENV_SECRET_PASSWORD for decryption.")
-    sys.exit(1)
+# === Decrypt .env.enc ===
+ENV_SECRET_PASSWORD = os.getenv("ENV_SECRET_PASSWORD")
 
-try:
+if ENV_SECRET_PASSWORD:
     subprocess.run([
         "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-d",
-        "-in", ENV_ENCRYPTED_FILE,
-        "-out", ENV_DECRYPTED_FILE,
-        "-pass", f"pass:{DECRYPTION_PASSWORD}"
+        "-in", ".env.enc",
+        "-out", ".env",
+        "-pass", f"pass:{ENV_SECRET_PASSWORD}"
     ], check=True)
-except subprocess.CalledProcessError:
-    print("❌ Failed to decrypt .env.enc")
-    sys.exit(1)
 
-# === STEP 2: Load environment variables ===
-load_dotenv(dotenv_path=ENV_DECRYPTED_FILE)
+# === Load environment ===
+load_dotenv(".env")
 
-API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ZIP_PASSWORD = os.getenv("ZIP_PASSWORD")
 
-if not API_KEY or not ZIP_PASSWORD:
-    print("❌ Missing required environment variables.")
-    sys.exit(1)
-
-# === Optional: Clean up the decrypted .env ===
-try:
-    os.remove(ENV_DECRYPTED_FILE)
-except Exception as e:
-    print(f"⚠️ Warning: Could not delete .env: {e}")
-
-# === STEP 3: Main Logic ===
 API_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": f"Bearer {API_KEY}"
+    "Authorization": f"Bearer {OPENAI_API_KEY}"
 }
 
-INPUT_ZIP = "input.zip"
-OUTPUT_ZIP = "output.zip"
-PLAIN_OUTPUT = "output.txt"
-INPUT_FILENAME = "input.txt"
 
-try:
-    # Step 4: Extract input
-    if not os.path.exists(INPUT_ZIP):
-        raise FileNotFoundError(f"ZIP file not found: {INPUT_ZIP}")
+@app.route('/generate', methods=['POST'])
+def generate():
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "Missing file parameter"}), 400
 
-    with pyzipper.AESZipFile(INPUT_ZIP, "r") as zf:
-        zf.pwd = ZIP_PASSWORD.encode("utf-8")
-        if INPUT_FILENAME not in zf.namelist():
-            raise FileNotFoundError(f"{INPUT_FILENAME} not found in ZIP")
-        user_prompt = zf.read(INPUT_FILENAME).decode("utf-8").strip()
+        file = request.files['file']
+        if file.filename != "input.zip":
+            return jsonify({"error": "Uploaded file must be named 'input.zip'"}), 400
 
-    if not user_prompt:
-        raise ValueError("Input prompt is empty.")
+        input_path = "input.zip"
+        output_path = "output.zip"
+        plain_output = "output.txt"
 
-    # Step 5: Send request
-    data = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": user_prompt}]
-    }
+        file.save(input_path)
 
-    response = requests.post(API_URL, headers=HEADERS, json=data)
-    if response.status_code != 200:
-        raise RuntimeError(f"API error {response.status_code}: {response.text}")
+        # Step 1: Read prompt from ZIP
+        with pyzipper.AESZipFile(input_path, "r") as zf:
+            zf.pwd = ZIP_PASSWORD.encode("utf-8")
+            if "input.txt" not in zf.namelist():
+                return jsonify({"error": "input.txt not found in ZIP"}), 400
+            user_prompt = zf.read("input.txt").decode("utf-8").strip()
 
-    reply = response.json()["choices"][0]["message"]["content"]
+        if not user_prompt:
+            return jsonify({"error": "Prompt is empty"}), 400
 
-    # Step 6: Save plain output
-    with open(PLAIN_OUTPUT, "w", encoding="utf-8") as out:
-        out.write(reply)
+        # Step 2: Send to OpenAI
+        data = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": user_prompt}]
+        }
 
-    # Step 7: Encrypt output
-    with pyzipper.AESZipFile(OUTPUT_ZIP, "w", compression=pyzipper.ZIP_DEFLATED,
-                             encryption=pyzipper.WZ_AES) as zf:
-        zf.setpassword(ZIP_PASSWORD.encode("utf-8"))
-        zf.write(PLAIN_OUTPUT)
+        response = requests.post(API_URL, headers=HEADERS, json=data)
+        if response.status_code != 200:
+            return jsonify({"error": f"OpenAI Error: {response.text}"}), 500
 
-    os.remove(PLAIN_OUTPUT)
-    print(f"✅ Success! Response saved to {OUTPUT_ZIP}")
+        reply = response.json()["choices"][0]["message"]["content"]
 
-except Exception as e:
-    print(f"❌ Error: {e}")
-    sys.exit(1)
+        # Step 3: Save and ZIP result
+        with open(plain_output, "w", encoding="utf-8") as out:
+            out.write(reply)
+
+        with pyzipper.AESZipFile(output_path, "w", compression=pyzipper.ZIP_DEFLATED,
+                                 encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(ZIP_PASSWORD.encode("utf-8"))
+            zf.write(plain_output)
+
+        # Clean up
+        os.remove(input_path)
+        os.remove(plain_output)
+
+        return send_file(output_path, as_attachment=True)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "✅ OpenAI ZIP API is running!"
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
